@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: office-face-gps-attendance
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: OFFICE_LATITUDE
+        sync: false
+      - key: OFFICE_LONGITUDE
+        sync: false
+      - key: OFFICE_RADIUS_METERS
+        value: "100"
+      - key: FACE_MATCH_THRESHOLD
+        value: "0.50"
+      - key: SESSION_HTTPS_ONLY
+        value: "true"
