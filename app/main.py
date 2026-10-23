@@ -1,4 +1,4 @@
-import csv, io, json, math, os
+import csv, io, json, math, os, secrets
 from datetime import datetime, date, timezone
 from pathlib import Path
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
@@ -80,13 +80,28 @@ def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
 
 def ensure_admin():
-    email = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
-    password = os.getenv("ADMIN_PASSWORD", "ChangeThis-Strong-Password-123!")
+    """Create the first admin ONLY if no admin exists yet.
+
+    Never overwrite or re-create an admin afterwards, so a password/email changed
+    from the Settings page is never replaced by the ADMIN_* env defaults.
+    """
     with SessionLocal() as db:
-        existing = db.scalar(select(User).where(User.email == email))
-        if not existing:
+        existing_admin = db.scalar(select(User).where(User.role == "admin").order_by(User.id))
+        if existing_admin:
+            return
+        email = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
+        password = os.getenv("ADMIN_PASSWORD", "").strip()
+        if not password:
+            password = secrets.token_urlsafe(16)
+            print(f"[ensure_admin] ADMIN_PASSWORD not set. Temporary admin password: {password}", flush=True)
+        # If this email already belongs to a non-admin user, promote it instead of crashing.
+        user = db.scalar(select(User).where(User.email == email))
+        if user:
+            user.role = "admin"
+            user.active = True
+        else:
             db.add(User(name="Administrator", email=email, password_hash=hash_password(password), role="admin"))
-            db.commit()
+        db.commit()
 ensure_admin()
 
 @app.get("/health")
