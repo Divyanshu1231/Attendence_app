@@ -80,25 +80,41 @@ def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
 
 def ensure_admin():
-    """Create the first admin ONLY if no admin exists yet.
+    """Create the first admin only if none exists.
 
-    Never overwrite or re-create an admin afterwards, so a password/email changed
-    from the Settings page is never replaced by the ADMIN_* env defaults.
+    Normal restarts NEVER touch an existing admin, so a password changed from the
+    Settings page survives restarts/redeploys.
+
+    Emergency reset: set ADMIN_FORCE_RESET=true (plus ADMIN_EMAIL / ADMIN_PASSWORD)
+    in Render, redeploy, log in, then set ADMIN_FORCE_RESET back to false.
     """
+    email = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
+    password = os.getenv("ADMIN_PASSWORD", "").strip()
+    force = os.getenv("ADMIN_FORCE_RESET", "false").strip().lower() == "true"
     with SessionLocal() as db:
-        existing_admin = db.scalar(select(User).where(User.role == "admin").order_by(User.id))
-        if existing_admin:
+        admin = db.scalar(select(User).where(User.email == email, User.role == "admin"))
+        if admin is None:
+            admin = db.scalar(select(User).where(User.role == "admin").order_by(User.id))
+
+        if admin is not None:
+            if force and password:
+                clash = db.scalar(select(User).where(User.email == email, User.id != admin.id))
+                if not clash:
+                    admin.email = email
+                admin.password_hash = hash_password(password)
+                admin.active = True
+                db.commit()
+                print("[ensure_admin] Admin password reset from env. Set ADMIN_FORCE_RESET=false now.", flush=True)
             return
-        email = os.getenv("ADMIN_EMAIL", "admin@example.com").strip().lower()
-        password = os.getenv("ADMIN_PASSWORD", "").strip()
+
         if not password:
             password = secrets.token_urlsafe(16)
             print(f"[ensure_admin] ADMIN_PASSWORD not set. Temporary admin password: {password}", flush=True)
-        # If this email already belongs to a non-admin user, promote it instead of crashing.
         user = db.scalar(select(User).where(User.email == email))
         if user:
             user.role = "admin"
             user.active = True
+            user.password_hash = hash_password(password)
         else:
             db.add(User(name="Administrator", email=email, password_hash=hash_password(password), role="admin"))
         db.commit()
