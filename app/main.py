@@ -1,6 +1,7 @@
 import csv, io, json, math, os, secrets
 from datetime import datetime, date, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,10 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 Base.metadata.create_all(bind=engine)
 
 HTTPS_ONLY = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
+APP_TZ = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Kolkata"))
+
+def today_str():
+    return datetime.now(APP_TZ).date().isoformat()
 
 def get_setting(db: Session, key: str, env_key: str, default: str) -> str:
     saved = db.get(AppSetting, key)
@@ -74,7 +79,7 @@ def local_time(value):
         return "—"
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone().strftime("%I:%M %p")
+    return value.astimezone(APP_TZ).strftime("%I:%M %p")
 
 def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
@@ -157,7 +162,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
     except HTTPException:
         return RedirectResponse("/login", status_code=303)
     employees = db.scalars(select(User).where(User.role == "employee").order_by(User.name)).all()
-    today = date.today().isoformat()
+    today = today_str()
     cfg = office_config(db)
     records = db.scalars(select(Attendance).where(Attendance.work_date == today).order_by(desc(Attendance.check_in))).all()
     rows = [{"name": a.employee.name, "email": a.employee.email, "check_in": local_time(a.check_in), "check_out": local_time(a.check_out), "status": a.status} for a in records]
@@ -233,7 +238,7 @@ def employee_page(request: Request, db: Session = Depends(get_db)):
         user = require_user(request, db)
     except HTTPException:
         return RedirectResponse("/login", status_code=303)
-    today = date.today().isoformat()
+    today = today_str()
     cfg = office_config(db)
     record = db.scalar(select(Attendance).where(Attendance.user_id == user.id, Attendance.work_date == today))
     return page(request, "employee.html", user=user, record=record, today=today, radius=int(cfg["radius"]), has_face=bool(user.face_descriptor))
@@ -276,7 +281,7 @@ async def attendance_action(action: str, request: Request, db: Session = Depends
     score = math.sqrt(sum((float(a)-float(b))**2 for a,b in zip(saved, descriptor)) / len(saved))
     if score > cfg["face_threshold"]:
         raise HTTPException(status_code=403, detail="Face verification failed. Try again in good lighting.")
-    today = date.today().isoformat()
+    today = today_str()
     record = db.scalar(select(Attendance).where(Attendance.user_id == user.id, Attendance.work_date == today))
     now = now_utc()
     if action == "check-in":
