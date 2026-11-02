@@ -1,4 +1,6 @@
-import csv, io, json, math, os, secrets, urllib.request, urllib.error
+import csv, io, json, math, os, secrets, smtplib
+from email.message import EmailMessage
+from email.utils import formataddr
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -85,10 +87,13 @@ def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
 
 # ---------------------------------------------------------------------------
-# Late check-in reminder mails (sent over HTTPS via Brevo API, because Render
-# free web services block outbound SMTP ports 25/465/587).
-# Env: BREVO_API_KEY, MAIL_FROM_EMAIL, MAIL_FROM_NAME, SHIFT_START (09:00),
-#      LATE_GRACE_MINUTES (0), LATE_LIMIT_DAYS (3), LATE_MAIL_ENABLED (true)
+# Late check-in reminder mails, sent through Gmail SMTP.
+# Env: GMAIL_USER, GMAIL_APP_PASSWORD (16-char Google App Password),
+#      MAIL_FROM_NAME, SMTP_PORT (465 SSL default, or 587 STARTTLS),
+#      SHIFT_START (09:00), LATE_GRACE_MINUTES (0), LATE_LIMIT_DAYS (3),
+#      LATE_MAIL_ENABLED (true)
+# NOTE: Render FREE web services block outbound SMTP ports 25/465/587, so this
+# only works on a paid Render instance.
 # ---------------------------------------------------------------------------
 def late_minutes_for(check_in) -> int:
     """Minutes late versus SHIFT_START (IST). 0 = on time."""
@@ -118,32 +123,34 @@ def late_days_in_month(db: Session, user_id: int, work_date: str) -> int:
     return sum(1 for r in rows if late_minutes_for(r.check_in) > 0)
 
 def send_mail(to_email: str, to_name: str, subject: str, text: str, cc_email: str = ""):
-    api_key = os.getenv("BREVO_API_KEY", "").strip()
-    sender = os.getenv("MAIL_FROM_EMAIL", "").strip()
-    if not api_key or not sender:
-        print("[mail] BREVO_API_KEY / MAIL_FROM_EMAIL not set - mail skipped.", flush=True)
+    user = os.getenv("GMAIL_USER", "").strip()
+    password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    if not user or not password:
+        print("[mail] GMAIL_USER / GMAIL_APP_PASSWORD not set - mail skipped.", flush=True)
         return
-    payload = {
-        "sender": {"name": os.getenv("MAIL_FROM_NAME", "HR - Attendance"), "email": sender},
-        "to": [{"email": to_email, "name": to_name}],
-        "subject": subject,
-        "textContent": text,
-    }
-    if cc_email and cc_email.lower() != to_email.lower():
-        payload["cc"] = [{"email": cc_email}]
-    req = urllib.request.Request(
-        "https://api.brevo.com/v3/smtp/email",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"api-key": api_key, "content-type": "application/json", "accept": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            print(f"[mail] sent to {to_email} (HTTP {resp.status})", flush=True)
-    except urllib.error.HTTPError as exc:
-        print(f"[mail] FAILED for {to_email}: HTTP {exc.code} {exc.read().decode('utf-8', 'ignore')[:300]}", flush=True)
+        port = int(os.getenv("SMTP_PORT", "465"))
+    except ValueError:
+        port = 465
+    msg = EmailMessage()
+    msg["From"] = formataddr((os.getenv("MAIL_FROM_NAME", "HR - Attendance"), user))
+    msg["To"] = formataddr((to_name, to_email))
+    if cc_email and cc_email.lower() != to_email.lower():
+        msg["Cc"] = cc_email
+    msg["Subject"] = subject
+    msg.set_content(text)
+    try:
+        if port == 465:
+            server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20)
+        else:
+            server = smtplib.SMTP("smtp.gmail.com", port, timeout=20)
+            server.starttls()
+        with server:
+            server.login(user, password)
+            server.send_message(msg)
+        print(f"[mail] sent to {to_email}", flush=True)
     except Exception as exc:
-        print(f"[mail] FAILED for {to_email}: {exc}", flush=True)
+        print(f"[mail] FAILED for {to_email}: {exc!r} (on Render free plan SMTP ports are blocked)", flush=True)
 
 def send_late_mail(email: str, name: str, work_date: str, check_in_text: str, late_min: int, late_days: int):
     try:
