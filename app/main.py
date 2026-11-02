@@ -1,13 +1,13 @@
-import csv, io, json, math, os, secrets
-from datetime import datetime, date, timezone
+import csv, io, json, math, os, secrets, urllib.request, urllib.error
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi import FastAPI, Request, Depends, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, delete
 from .database import Base, engine, get_db, SessionLocal
 from .models import User, Attendance, AppSetting
 from .security import hash_password, verify_password, make_session, read_session
@@ -84,6 +84,93 @@ def local_time(value):
 def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
 
+# ---------------------------------------------------------------------------
+# Late check-in reminder mails (sent over HTTPS via Brevo API, because Render
+# free web services block outbound SMTP ports 25/465/587).
+# Env: BREVO_API_KEY, MAIL_FROM_EMAIL, MAIL_FROM_NAME, SHIFT_START (09:00),
+#      LATE_GRACE_MINUTES (0), LATE_LIMIT_DAYS (3), LATE_MAIL_ENABLED (true)
+# ---------------------------------------------------------------------------
+def late_minutes_for(check_in) -> int:
+    """Minutes late versus SHIFT_START (IST). 0 = on time."""
+    if check_in is None:
+        return 0
+    if check_in.tzinfo is None:
+        check_in = check_in.replace(tzinfo=timezone.utc)
+    ci = check_in.astimezone(APP_TZ)
+    try:
+        hh, mm = [int(x) for x in os.getenv("SHIFT_START", "09:00").split(":")[:2]]
+    except ValueError:
+        hh, mm = 9, 0
+    start = ci.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    mins = int((ci - start).total_seconds() // 60)
+    try:
+        grace = int(os.getenv("LATE_GRACE_MINUTES", "0"))
+    except ValueError:
+        grace = 0
+    return mins if mins > grace else 0
+
+def late_days_in_month(db: Session, user_id: int, work_date: str) -> int:
+    rows = db.scalars(select(Attendance).where(
+        Attendance.user_id == user_id,
+        Attendance.work_date.like(work_date[:7] + "%"),
+        Attendance.check_in.is_not(None),
+    )).all()
+    return sum(1 for r in rows if late_minutes_for(r.check_in) > 0)
+
+def send_mail(to_email: str, to_name: str, subject: str, text: str, cc_email: str = ""):
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender = os.getenv("MAIL_FROM_EMAIL", "").strip()
+    if not api_key or not sender:
+        print("[mail] BREVO_API_KEY / MAIL_FROM_EMAIL not set - mail skipped.", flush=True)
+        return
+    payload = {
+        "sender": {"name": os.getenv("MAIL_FROM_NAME", "HR - Attendance"), "email": sender},
+        "to": [{"email": to_email, "name": to_name}],
+        "subject": subject,
+        "textContent": text,
+    }
+    if cc_email and cc_email.lower() != to_email.lower():
+        payload["cc"] = [{"email": cc_email}]
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"api-key": api_key, "content-type": "application/json", "accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"[mail] sent to {to_email} (HTTP {resp.status})", flush=True)
+    except urllib.error.HTTPError as exc:
+        print(f"[mail] FAILED for {to_email}: HTTP {exc.code} {exc.read().decode('utf-8', 'ignore')[:300]}", flush=True)
+    except Exception as exc:
+        print(f"[mail] FAILED for {to_email}: {exc}", flush=True)
+
+def send_late_mail(email: str, name: str, work_date: str, check_in_text: str, late_min: int, late_days: int):
+    try:
+        limit = int(os.getenv("LATE_LIMIT_DAYS", "3"))
+    except ValueError:
+        limit = 3
+    shift = os.getenv("SHIFT_START", "09:00")
+    lines = [
+        f"Dear {name},",
+        "",
+        f"You checked in at {check_in_text} on {work_date}, which is {late_min} minute(s) after the office start time of {shift}.",
+        f"Late arrivals recorded this month: {late_days}.",
+    ]
+    cc = ""
+    if late_days > limit:
+        lines += [
+            "",
+            f"As you have been late on more than {limit} days this month, a half-day salary deduction will be applied as per company policy.",
+        ]
+        cc = os.getenv("ADMIN_EMAIL", "").strip()
+        subject = f"Late arrival: {late_min} min - half-day salary deduction notice"
+    else:
+        lines += ["", f"Please arrive on time. More than {limit} late days in a month will result in a half-day salary deduction."]
+        subject = f"Late arrival reminder: {late_min} minute(s) late"
+    lines += ["", "Regards,", "HR Team"]
+    send_mail(email, name, subject, "\n".join(lines), cc)
+
 def ensure_admin():
     """Create the first admin only if none exists.
 
@@ -125,6 +212,33 @@ def ensure_admin():
         db.commit()
 ensure_admin()
 
+_last_cleanup_day = None
+
+def cleanup_old_attendance():
+    """Delete attendance older than ATTENDANCE_RETENTION_DAYS (0 = keep everything).
+
+    1 = keep only today, 7 = last 7 days incl. today, 90 = ~3 months, etc.
+    Runs at most once per day (IST).
+    """
+    global _last_cleanup_day
+    try:
+        days = int(os.getenv("ATTENDANCE_RETENTION_DAYS", "0"))
+    except ValueError:
+        days = 0
+    if days <= 0:
+        return
+    today = today_str()
+    if _last_cleanup_day == today:
+        return
+    cutoff = (datetime.now(APP_TZ).date() - timedelta(days=days - 1)).isoformat()
+    with SessionLocal() as db:
+        res = db.execute(delete(Attendance).where(Attendance.work_date < cutoff))
+        db.commit()
+        print(f"[cleanup] deleted {res.rowcount} attendance rows older than {cutoff}", flush=True)
+    _last_cleanup_day = today
+
+cleanup_old_attendance()
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -161,6 +275,7 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
         admin = require_admin(request, db)
     except HTTPException:
         return RedirectResponse("/login", status_code=303)
+    cleanup_old_attendance()
     employees = db.scalars(select(User).where(User.role == "employee").order_by(User.name)).all()
     today = today_str()
     cfg = office_config(db)
@@ -246,6 +361,7 @@ def employee_page(request: Request, db: Session = Depends(get_db)):
 @app.post("/api/face/enroll")
 async def enroll_face(request: Request, db: Session = Depends(get_db)):
     user = require_user(request, db)
+    cleanup_old_attendance()
     # Allow both admin and employee accounts to enroll their own face / mark attendance.
     if user.role not in {"admin", "employee"}:
         raise HTTPException(status_code=403, detail="Unsupported account role.")
@@ -258,7 +374,7 @@ async def enroll_face(request: Request, db: Session = Depends(get_db)):
     return {"ok": True, "message": "Face enrollment saved."}
 
 @app.post("/api/attendance/{action}")
-async def attendance_action(action: str, request: Request, db: Session = Depends(get_db)):
+async def attendance_action(action: str, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     user = require_user(request, db)
     # Allow both admin and employee accounts to enroll their own face / mark attendance.
     if user.role not in {"admin", "employee"}:
@@ -308,7 +424,16 @@ async def attendance_action(action: str, request: Request, db: Session = Depends
             raise HTTPException(status_code=400, detail="No active lunch break.")
         record.lunch_end = now
     db.commit()
-    return {"ok": True, "message": {"check-in":"Attendance checked in successfully.","check-out":"Checked out successfully.","lunch-start":"Lunch break started.","lunch-end":"Lunch break ended."}[action], "record":{"check_in":local_time(record.check_in),"check_out":local_time(record.check_out)}}
+    messages = {"check-in":"Attendance checked in successfully.","check-out":"Checked out successfully.","lunch-start":"Lunch break started.","lunch-end":"Lunch break ended."}
+    msg = messages[action]
+    if action == "check-in" and user.role == "employee":
+        late_min = late_minutes_for(record.check_in)
+        if late_min > 0:
+            msg = f"Checked in. You are {late_min} minute(s) late."
+            if os.getenv("LATE_MAIL_ENABLED", "true").lower() == "true":
+                late_days = late_days_in_month(db, user.id, record.work_date)
+                background_tasks.add_task(send_late_mail, user.email, user.name, record.work_date, local_time(record.check_in), late_min, late_days)
+    return {"ok": True, "message": msg, "record": {"check_in": local_time(record.check_in), "check_out": local_time(record.check_out)}}
 
 @app.get("/admin/export.csv")
 def export_csv(request: Request, db: Session = Depends(get_db), start: str = "", end: str = ""):
