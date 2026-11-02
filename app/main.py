@@ -1,4 +1,4 @@
-import csv, io, json, math, os, secrets, smtplib
+import csv, io, json, math, os, secrets, smtplib, urllib.request, urllib.error
 from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime, date, timedelta, timezone
@@ -87,8 +87,11 @@ def page(request, template, **context):
     return templates.TemplateResponse(request=request, name=template, context={"request": request, **context})
 
 # ---------------------------------------------------------------------------
-# Late check-in reminder mails, sent through Gmail SMTP.
-# Env: GMAIL_USER, GMAIL_APP_PASSWORD (16-char Google App Password),
+# Late check-in reminder mails.
+# Mode 1 (works on Render FREE): Google Apps Script relay over HTTPS.
+#   Env: MAIL_RELAY_URL, MAIL_RELAY_SECRET
+# Mode 2 (Render PAID only, SMTP ports are blocked on free): Gmail SMTP.
+#   Env: GMAIL_USER, GMAIL_APP_PASSWORD (16-char Google App Password),
 #      MAIL_FROM_NAME, SMTP_PORT (465 SSL default, or 587 STARTTLS),
 #      SHIFT_START (09:00), LATE_GRACE_MINUTES (0), LATE_LIMIT_DAYS (3),
 #      LATE_MAIL_ENABLED (true)
@@ -122,11 +125,36 @@ def late_days_in_month(db: Session, user_id: int, work_date: str) -> int:
     )).all()
     return sum(1 for r in rows if late_minutes_for(r.check_in) > 0)
 
+def send_mail_via_relay(to_email: str, to_name: str, subject: str, text: str, cc_email: str = ""):
+    url = os.getenv("MAIL_RELAY_URL", "").strip()
+    payload = {
+        "secret": os.getenv("MAIL_RELAY_SECRET", "").strip(),
+        "to": to_email,
+        "subject": subject,
+        "text": text,
+        "cc": cc_email if cc_email and cc_email.lower() != to_email.lower() else "",
+        "from_name": os.getenv("MAIL_FROM_NAME", "HR - Attendance"),
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        # Apps Script answers the POST with a 302; urllib follows it with GET, which returns the result.
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", "ignore")[:300]
+        if '"ok":true' in body.replace(" ", ""):
+            print(f"[mail] sent to {to_email} via relay", flush=True)
+        else:
+            print(f"[mail] relay FAILED for {to_email}: {body}", flush=True)
+    except Exception as exc:
+        print(f"[mail] relay FAILED for {to_email}: {exc!r}", flush=True)
+
 def send_mail(to_email: str, to_name: str, subject: str, text: str, cc_email: str = ""):
+    if os.getenv("MAIL_RELAY_URL", "").strip():
+        return send_mail_via_relay(to_email, to_name, subject, text, cc_email)
     user = os.getenv("GMAIL_USER", "").strip()
     password = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
     if not user or not password:
-        print("[mail] GMAIL_USER / GMAIL_APP_PASSWORD not set - mail skipped.", flush=True)
+        print("[mail] MAIL_RELAY_URL (or GMAIL_USER / GMAIL_APP_PASSWORD) not set - mail skipped.", flush=True)
         return
     try:
         port = int(os.getenv("SMTP_PORT", "465"))
