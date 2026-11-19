@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, delete
 from .database import Base, engine, get_db, SessionLocal
-from .models import User, Attendance, AppSetting
+from .models import User, Attendance, AppSetting, OfficeLocation
 from .security import hash_password, verify_password, make_session, read_session
 
 BASE = Path(__file__).resolve().parent
@@ -45,6 +45,13 @@ def office_config(db: Session):
         "radius": max(20.0, float(get_setting(db, "office_radius_meters", "OFFICE_RADIUS_METERS", "100"))),
         "face_threshold": float(get_setting(db, "face_match_threshold", "FACE_MATCH_THRESHOLD", "0.50")),
     }
+
+def all_locations(db: Session):
+    cfg = office_config(db)
+    locations = [{"id": None, "name": "Main office", "latitude": cfg["latitude"], "longitude": cfg["longitude"], "radius": cfg["radius"]}]
+    for loc in db.scalars(select(OfficeLocation).order_by(OfficeLocation.id)).all():
+        locations.append({"id": loc.id, "name": loc.name, "latitude": loc.latitude, "longitude": loc.longitude, "radius": max(20.0, float(loc.radius))})
+    return locations
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -317,7 +324,9 @@ def admin_page(request: Request, db: Session = Depends(get_db)):
     records = db.scalars(select(Attendance).where(Attendance.work_date == today).order_by(desc(Attendance.check_in))).all()
     rows = [{"name": a.employee.name, "email": a.employee.email, "check_in": local_time(a.check_in), "check_out": local_time(a.check_out), "status": a.status} for a in records]
     settings = {**cfg, "admin_email": admin.email, "message": request.query_params.get("saved"), "error_code": request.query_params.get("settings_error")}
-    return page(request, "admin.html", user=admin, employees=employees, rows=rows, today=today, radius=int(cfg["radius"]), settings=settings, error=None)
+    extra_locations = db.scalars(select(OfficeLocation).order_by(OfficeLocation.id)).all()
+    loc_error = request.query_params.get("loc_error")
+    return page(request, "admin.html", user=admin, employees=employees, rows=rows, today=today, radius=int(cfg["radius"]), settings=settings, error=None, extra_locations=extra_locations, loc_saved=request.query_params.get("loc_saved"), loc_error=loc_error)
 
 @app.post("/admin/employees")
 def create_employee(request: Request, name: str = Form(...), email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
@@ -382,6 +391,29 @@ def save_admin_settings(
     db.commit()
     return RedirectResponse("/admin?saved=1", status_code=303)
 
+@app.post("/admin/locations")
+def add_location(request: Request, name: str = Form(...), latitude: str = Form(...), longitude: str = Form(...), radius: int = Form(100), db: Session = Depends(get_db)):
+    require_admin(request, db)
+    name = name.strip()
+    try:
+        lat, lon = float(latitude), float(longitude)
+    except (TypeError, ValueError):
+        return RedirectResponse("/admin?loc_error=1#locations", status_code=303)
+    if not name or len(name) > 120 or not (-90 <= lat <= 90 and -180 <= lon <= 180 and 20 <= radius <= 5000):
+        return RedirectResponse("/admin?loc_error=1#locations", status_code=303)
+    db.add(OfficeLocation(name=name, latitude=lat, longitude=lon, radius=radius))
+    db.commit()
+    return RedirectResponse("/admin?loc_saved=1#locations", status_code=303)
+
+@app.post("/admin/locations/{loc_id}/delete")
+def delete_location(loc_id: int, request: Request, db: Session = Depends(get_db)):
+    require_admin(request, db)
+    loc = db.get(OfficeLocation, loc_id)
+    if loc:
+        db.delete(loc)
+        db.commit()
+    return RedirectResponse("/admin?loc_saved=1#locations", status_code=303)
+
 @app.get("/employee", response_class=HTMLResponse)
 def employee_page(request: Request, db: Session = Depends(get_db)):
     try:
@@ -421,9 +453,15 @@ async def attendance_action(action: str, request: Request, background_tasks: Bac
     if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise HTTPException(status_code=400, detail="Valid GPS location is required.")
     cfg = office_config(db)
-    distance = haversine_m(float(lat), float(lon), cfg["latitude"], cfg["longitude"])
-    if distance > cfg["radius"]:
-        raise HTTPException(status_code=403, detail=f"Attendance blocked: reported location is {int(distance)}m from office; allowed radius is {int(cfg['radius'])}m.")
+    locations = all_locations(db)
+    # distance to each approved location; allowed if inside the radius of ANY of them
+    measured = [(haversine_m(float(lat), float(lon), l["latitude"], l["longitude"]), l) for l in locations]
+    inside = [(d, l) for d, l in measured if d <= l["radius"]]
+    if inside:
+        distance, matched = min(inside, key=lambda x: x[0])
+    else:
+        nearest_d, nearest = min(measured, key=lambda x: x[0] - x[1]["radius"])
+        raise HTTPException(status_code=403, detail=f"Attendance blocked: you are {int(nearest_d)}m from {nearest['name']}; allowed radius is {int(nearest['radius'])}m.")
     if not user.face_descriptor:
         raise HTTPException(status_code=400, detail="Enroll your face first.")
     if not valid_descriptor(descriptor):
