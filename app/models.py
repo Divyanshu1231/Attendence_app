@@ -38,3 +38,13 @@ class AppSetting(Base):
     __tablename__ = "app_settings"
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class OfficeLocation(Base):
+    """Extra approved attendance locations (the main office stays in app settings)."""
+    __tablename__ = "office_locations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    latitude: Mapped[float] = mapped_column(Float, nullable=False)
+    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    radius: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
